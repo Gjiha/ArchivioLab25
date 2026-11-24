@@ -1,11 +1,30 @@
 #!/usr/bin/env python3
 """
 enrich_materials.py — arricchisce un elenco di materiali di studio
-con i metadati dell'ultima release del repository GitHub associato.
+con i metadati dell'ultima release del repository GitHub associato,
+oppure di una release specifica (link_release).
+
+Formato input (repos.json): lista di oggetti con i campi del README:
+    - title
+    - description (opzionale)
+    - type ("Appunti", "Esercizi", "Soluzioni", "Formulari")
+    - link_repository (→ ultima release)    ┐ almeno uno
+    - link_release    (→ release specifica) ┘
+    - course
+    - tags (opzionale)
 
 USO
-    export GITHUB_TOKEN=ghp_xxx          # opzionale, ma raccomandato (rate limit)
-    python enrich_materials.py in.json out.json
+    export GITHUB_TOKEN=ghp_xxx          # opzionale, ma raccomandato
+    python enrich_materials.py in.json out.json [--refresh]
+
+CACHING
+- In-run: la stessa chiamata API non viene ripetuta (cache di GitHubClient).
+- Cross-run: se `out.json` esiste già, le entry la cui chiave (link_repository
+  o link_release) è già presente NON vengono ricercate di nuovo; i campi
+  provenienti da GitHub (author, date, fileUrl, fileType, fileSize, downloads)
+  vengono riusati dal file esistente, mentre i campi utente (title, description,
+  type, course, tags) vengono ricalcolati dall'input.
+- `--refresh` svuota la cache cross-run e forza il re-fetch.
 
 SICUREZZA — requisiti rispettati
 - Nessun download: gli asset delle release NON vengono scaricati.
@@ -16,7 +35,7 @@ SICUREZZA — requisiti rispettati
 COSA VIENE LETTO DAL REPO
 - Owner (fallback per `author`)
 - `pushed_at` (fallback per `date` se manca la release)
-- Ultima release pubblicata:
+- Release (ultima o specifica):
     - `published_at`    → `date`
     - `author.login`    → `author` (se ancora vuoto)
     - asset `.pdf` o `.zip` (preferendo il PDF, poi il file più grande)
@@ -37,7 +56,7 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
 GITHUB_API = "https://api.github.com"
@@ -46,6 +65,9 @@ REQUEST_TIMEOUT = 15
 REQUEST_DELAY = 0.5  # secondi tra due chiamate API
 
 ALLOWED_EXTENSIONS = {"pdf", "zip"}
+
+# Campi arricchiti da GitHub, riusabili dalla cache cross-run.
+GITHUB_CACHEABLE_FIELDS = ("author", "date", "fileUrl", "fileType", "fileSize", "downloads")
 
 
 # --------------------------------------------------------------------------- #
@@ -76,12 +98,48 @@ def parse_github_url(url: str) -> tuple[str, str] | None:
     if repo.endswith(".git"):
         repo = repo[:-4]
 
-    # Sanifica per evitare path traversal nelle chiamate API
     if not re.fullmatch(r"[A-Za-z0-9._-]+", owner):
         return None
     if not re.fullmatch(r"[A-Za-z0-9._-]+", repo):
         return None
     return owner, repo
+
+
+def parse_release_url(url: str) -> tuple[str, str, str | None] | None:
+    """
+    Estrae (owner, repo, tag) da un URL di release GitHub.
+
+    - https://github.com/owner/repo/releases/tag/<tag>  → (owner, repo, "<tag>")
+    - https://github.com/owner/repo/releases/latest     → (owner, repo, None)
+
+    Ritorna None se non è un URL di release valido.
+    """
+    if not url:
+        return None
+    url = url.strip().rstrip("/")
+    if "://" not in url:
+        url = "https://" + url
+
+    p = urlparse(url)
+    if p.netloc.lower() not in {"github.com", "www.github.com"}:
+        return None
+    parts = [x for x in p.path.split("/") if x]
+    if len(parts) < 4 or parts[2] != "releases":
+        return None
+
+    owner, repo = parts[0], parts[1]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", owner):
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", repo):
+        return None
+
+    if parts[3] == "tag" and len(parts) >= 5:
+        return owner, repo, unquote(parts[4])
+    if parts[3] == "latest":
+        return owner, repo, None
+    return None
 
 
 def human_size(n: int | float | None) -> str:
@@ -191,6 +249,7 @@ class GitHubClient:
     def __init__(self, token: str | None = None):
         self.token = token
         self._last_call = 0.0
+        self._cache: dict[str, Any] = {}  # path → JSON (cache in-run)
 
     def _throttle(self) -> None:
         delta = time.time() - self._last_call
@@ -199,7 +258,10 @@ class GitHubClient:
         self._last_call = time.time()
 
     def get(self, path: str) -> Any:
-        """GET api.github.com{path}. Ritorna JSON parsato oppure None."""
+        """GET api.github.com{path}. Cache in memoria. Ritorna JSON o None."""
+        if path in self._cache:
+            return self._cache[path]
+
         self._throttle()
         headers = {
             "Accept": "application/vnd.github+json",
@@ -210,20 +272,22 @@ class GitHubClient:
             headers["Authorization"] = f"Bearer {self.token}"
 
         req = Request(GITHUB_API + path, headers=headers, method="GET")
+        result: Any = None
         try:
             with urlopen(req, timeout=REQUEST_TIMEOUT) as r:
-                return json.loads(r.read().decode("utf-8"))
+                result = json.loads(r.read().decode("utf-8"))
         except HTTPError as e:
             if e.code == 404:
-                return None
-            if e.code in (403, 429):
+                result = None
+            elif e.code in (403, 429):
                 sys.stderr.write(f"[github] rate-limit / forbidden su {path}\n")
             else:
                 sys.stderr.write(f"[github] HTTP {e.code} su {path}\n")
-            return None
         except (URLError, TimeoutError, json.JSONDecodeError) as e:
             sys.stderr.write(f"[github] errore su {path}: {e}\n")
-            return None
+
+        self._cache[path] = result
+        return result
 
     def repo_info(self, owner: str, repo: str) -> dict | None:
         return self.get(f"/repos/{owner}/{repo}")
@@ -237,6 +301,9 @@ class GitHubClient:
         if isinstance(lst, list) and lst:
             return lst[0]
         return None
+
+    def release_by_tag(self, owner: str, repo: str, tag: str) -> dict | None:
+        return self.get(f"/repos/{owner}/{repo}/releases/tags/{tag}")
 
 
 # --------------------------------------------------------------------------- #
@@ -265,8 +332,9 @@ def pick_best_asset(assets: list[dict]) -> dict | None:
 #  Enrichment                                                                 #
 # --------------------------------------------------------------------------- #
 
-def enrich_one(item: dict, client: GitHubClient, idx: int, *, include_source_zip: bool) -> dict:
-    out = {
+def _build_output_base(item: dict, idx: int) -> dict:
+    """Campi 'utente' + placeholder per i campi GitHub."""
+    return {
         "id": f"mat-{idx:03d}",
         "title": item.get("title", "Materiale senza titolo"),
         "description": item.get("description", ""),
@@ -276,7 +344,6 @@ def enrich_one(item: dict, client: GitHubClient, idx: int, *, include_source_zip
         "author": item.get("author", ""),
         "date": item.get("date", ""),
         "type": (item.get("type") or "appunti").lower(),
-        "link_repository": item["repository_link"],
         "fileUrl": "",
         "fileType": "",
         "fileSize": "",
@@ -285,7 +352,65 @@ def enrich_one(item: dict, client: GitHubClient, idx: int, *, include_source_zip
         "tags": list(item.get("tags") or []),
     }
 
-    owner_repo = parse_github_url(item.get("repository_link", ""))
+
+def _apply_release(out: dict, release: dict | None, include_source_zip: bool) -> dict:
+    """Applica al dict `out` i campi derivati da una release (o None)."""
+    if not release:
+        out["preview"] = build_preview_html(out)
+        return out
+
+    if release.get("published_at"):
+        out["date"] = release["published_at"][:10]
+    rel_author = (release.get("author") or {}).get("login")
+    if rel_author and not out["author"]:
+        out["author"] = rel_author
+
+    assets = release.get("assets") or []
+    best = pick_best_asset(assets)
+    if best:
+        out["fileUrl"] = best.get("browser_download_url") or ""
+        name = (best.get("name") or "").lower()
+        out["fileType"] = name.rsplit(".", 1)[-1] if "." in name else ""
+        out["fileSize"] = human_size(best.get("size"))
+        out["downloads"] = sum(
+            int(a.get("download_count") or 0)
+            for a in assets
+            if ((a.get("name") or "").lower().rsplit(".", 1)[-1] in ALLOWED_EXTENSIONS)
+        )
+    elif include_source_zip:
+        zip_url = release.get("zipball_url")
+        if zip_url:
+            out["fileUrl"] = zip_url
+            out["fileType"] = "zip"
+            out["fileSize"] = ""
+
+    out["preview"] = build_preview_html(out)
+    return out
+
+
+def enrich_data(item: dict, client: GitHubClient, idx: int, *, include_source_zip: bool) -> dict:
+    """
+    Dispatcher in base al tipo di link:
+
+      - `link_release`    → enrich_two (release specifica)
+      - `link_repository` → enrich_one (ultima release del repository)
+      - nessuno dei due   → solo entry base con preview
+    """
+    if item.get("link_release"):
+        return enrich_two(item, client, idx, include_source_zip=include_source_zip)
+    if item.get("link_repository"):
+        return enrich_one(item, client, idx, include_source_zip=include_source_zip)
+    out = _build_output_base(item, idx)
+    out["preview"] = build_preview_html(out)
+    return out
+
+
+def enrich_one(item: dict, client: GitHubClient, idx: int, *, include_source_zip: bool) -> dict:
+    """link_repository → ultima release del repository."""
+    out = _build_output_base(item, idx)
+    out["link_repository"] = item.get("link_repository", "")
+
+    owner_repo = parse_github_url(out["link_repository"])
     if not owner_repo:
         out["preview"] = build_preview_html(out)
         return out
@@ -304,36 +429,89 @@ def enrich_one(item: dict, client: GitHubClient, idx: int, *, include_source_zip
 
     # 2) Ultima release
     release = client.latest_release(owner, repo)
-    if not release:
+    return _apply_release(out, release, include_source_zip)
+
+
+def enrich_two(item: dict, client: GitHubClient, idx: int, *, include_source_zip: bool) -> dict:
+    """link_release → release specifica (tag) oppure ultima se /releases/latest."""
+    out = _build_output_base(item, idx)
+    out["link_release"] = item.get("link_release", "")
+
+    parsed = parse_release_url(out["link_release"])
+    if not parsed:
         out["preview"] = build_preview_html(out)
         return out
 
-    if release.get("published_at"):
-        out["date"] = release["published_at"][:10]
-    rel_author = (release.get("author") or {}).get("login")
-    if rel_author and not out["author"]:
-        out["author"] = rel_author
+    owner, repo, tag = parsed
 
-    # 3) Asset .pdf / .zip nell'ultima release
-    assets = release.get("assets") or []
-    best = pick_best_asset(assets)
-    if best:
-        out["fileUrl"] = best.get("browser_download_url") or ""
-        name = (best.get("name") or "").lower()
-        out["fileType"] = name.rsplit(".", 1)[-1] if "." in name else ""
-        out["fileSize"] = human_size(best.get("size"))
-        out["downloads"] = sum(
-            int(a.get("download_count") or 0)
-            for a in assets
-            if ((a.get("name") or "").lower().rsplit(".", 1)[-1] in ALLOWED_EXTENSIONS)
-        )
-    elif include_source_zip:
-        # Fallback opzionale: zip auto-generato da GitHub (solo se esplicitamente attivato)
-        zip_url = release.get("zipball_url")
-        if zip_url:
-            out["fileUrl"] = zip_url
-            out["fileType"] = "zip"
-            out["fileSize"] = ""
+    info = client.repo_info(owner, repo)
+    if info:
+        if not out["author"]:
+            out["author"] = (info.get("owner") or {}).get("login") or owner
+        if not out["date"]:
+            pushed = info.get("pushed_at") or info.get("updated_at")
+            if pushed:
+                out["date"] = pushed[:10]
+
+    if tag is None:
+        release = client.latest_release(owner, repo)
+    else:
+        release = client.release_by_tag(owner, repo, tag)
+    return _apply_release(out, release, include_source_zip)
+
+
+# --------------------------------------------------------------------------- #
+#  Cache cross-run (out.json riusato come cache)                              #
+# --------------------------------------------------------------------------- #
+
+def cache_key(item: dict) -> tuple[str, str] | None:
+    """Chiave univoca per una entry di input (link_release prima di link_repository)."""
+    if item.get("link_release"):
+        return ("release", item["link_release"])
+    if item.get("link_repository"):
+        return ("repo", item["link_repository"])
+    return None
+
+
+def load_existing_cache(out_path: Path) -> dict[tuple[str, str], dict]:
+    """Carica un eventuale output.json e lo indicizza per link."""
+    cache: dict[tuple[str, str], dict] = {}
+    if not out_path.exists():
+        return cache
+    try:
+        data = json.loads(out_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return cache
+    if not isinstance(data, list):
+        return cache
+    for e in data:
+        if not isinstance(e, dict):
+            continue
+        if e.get("link_release"):
+            cache[("release", e["link_release"])] = e
+        elif e.get("link_repository"):
+            cache[("repo", e["link_repository"])] = e
+    return cache
+
+
+def merge_from_cache(item: dict, cached: dict, idx: int) -> dict:
+    """
+    Riusa i campi GitHub-cached ma riapplica i campi utente dall'input
+    (title, description, type, course, tags) così eventuali modifiche
+    al repos.json si riflettono anche in cache-hit.
+    """
+    out = _build_output_base(item, idx)
+
+    # Il link di provenienza serve per futuri cache-hit.
+    for k in ("link_repository", "link_release"):
+        if cached.get(k):
+            out[k] = cached[k]
+
+    # Campi arricchiti da GitHub: input vince se già valorizzato,
+    # altrimenti si prende dalla cache.
+    for k in GITHUB_CACHEABLE_FIELDS:
+        if not out.get(k) and cached.get(k):
+            out[k] = cached[k]
 
     out["preview"] = build_preview_html(out)
     return out
@@ -344,11 +522,16 @@ def enrich_one(item: dict, client: GitHubClient, idx: int, *, include_source_zip
 # --------------------------------------------------------------------------- #
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print("Uso: python enrich_materials.py <input.json> <output.json>", file=sys.stderr)
+    refresh = "--refresh" in argv
+    args = [a for a in argv[1:] if not a.startswith("--")]
+    if len(args) != 2:
+        print(
+            "Uso: python enrich_materials.py <input.json> <output.json> [--refresh]",
+            file=sys.stderr,
+        )
         return 2
 
-    in_path, out_path = Path(argv[1]), Path(argv[2])
+    in_path, out_path = Path(args[0]), Path(args[1])
 
     try:
         data = json.loads(in_path.read_text(encoding="utf-8"))
@@ -370,40 +553,49 @@ def main(argv: list[str]) -> int:
     client = GitHubClient(token=token)
     include_source_zip = os.environ.get("INCLUDE_SOURCE_ZIP", "0") == "1"
 
+    existing_cache = {} if refresh else load_existing_cache(out_path)
+    if existing_cache:
+        print(
+            f"[info] Cache: {len(existing_cache)} entry riusate da {out_path} "
+            f"(usa --refresh per svuotarla)",
+            file=sys.stderr,
+        )
+
     results: list[dict] = []
     total = len(data)
+    reused = 0
 
     for i, item in enumerate(data, start=1):
         if not isinstance(item, dict):
             sys.stderr.write(f"[skip] item {i} non è un oggetto\n")
             continue
 
+        key = cache_key(item)
+        hit_cache = key is not None and key in existing_cache
+
         try:
-            enriched = enrich_one(item, client, i, include_source_zip=include_source_zip)
+            if hit_cache:
+                enriched = merge_from_cache(item, existing_cache[key], i)
+                reused += 1
+            else:
+                enriched = enrich_data(item, client, i, include_source_zip=include_source_zip)
         except Exception as e:  # una riga rotta non ferma tutto
             sys.stderr.write(f"[error] item {i} ({item.get('title', '?')}): {e}\n")
-            enriched = {
-                "id": f"mat-{i:03d}",
-                "title": item.get("title", ""),
-                "description": item.get("description", ""),
-                "category": infer_category(item.get("course", ""), item.get("category")),
-                "course": item.get("course", ""),
-                "year": infer_year(item.get("course", ""), item.get("year")),
-                "author": item.get("author", ""),
-                "date": item.get("date", ""),
-                "type": (item.get("type") or "appunti").lower(),
-                "fileUrl": "", "fileType": "", "fileSize": "",
-                "pages": 0, "downloads": 0,
-                "tags": list(item.get("tags") or []),
-                "preview": "<p>Errore durante l'arricchimento.</p>",
-            }
+            enriched = _build_output_base(item, i)
+            enriched["preview"] = "<p>Errore durante l'arricchimento.</p>"
 
         results.append(enriched)
-        status = f"{enriched['fileType']} {enriched['fileUrl']}" if enriched["fileUrl"] else "(nessun asset .pdf/.zip)"
+
+        if hit_cache:
+            status = "(cache)"
+        elif enriched.get("fileUrl"):
+            status = f"{enriched['fileType']} {enriched['fileUrl']}"
+        else:
+            status = "(nessun asset .pdf/.zip)"
         print(f"[{i}/{total}] {enriched['title']} → {status}")
 
     out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"\nScritti {len(results)} elementi in {out_path}")
+    print(f"\nScritti {len(results)} elementi in {out_path} ({reused} dalla cache)")
     return 0
 
 
