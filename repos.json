@@ -1,1 +1,10 @@
-[]
+[
+  {
+        "title": "Appunti BigData 2025",
+        "description": "Appunti completi AA 25/26, arricchiti con dispense proposte dal prof.",
+        "type": "appunti",
+        "link_repository": "https://github.com/mirco0/AlgoritmiBigData",
+        "course": "AlgoritmiBigData",
+        "tags": ["Completi", "Clementi"]
+  }
+]
